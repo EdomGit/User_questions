@@ -3,4 +3,6 @@ python-dotenv
 tenacity
 requests
 beautifulsoup4
+fastapi
+uvicorn[standard]
 
