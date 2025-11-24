@@ -8,6 +8,7 @@ import os
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai import APIError, RateLimitError, APIConnectionError, APITimeoutError
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -79,13 +80,10 @@ def get_questions_from_text(text: str) -> list[str]:
         logger.info('Отправка запроса к OpenAI API...')
 
         prompt = (
-            "Проанализируй следующий текст и сгенерируй ровно 5 "
-            "пользовательских вопросов, которые могут возникнуть у читателя "
-            "после прочтения этого текста. Вопросы должны быть конкретными, "
-            "релевантными и полезными. Каждый вопрос должен быть на отдельной "
-            "строке, без нумерации и без дополнительных символов.\n\n"
+            "Ты пользователь. Какие вопросы у тебя возникли после прочтения?\n\n"
             f"Текст:\n{text}\n\n"
-            "Вопросы:"
+            "Сгенерируй ровно 5 содержательных вопросов, связанных с темой страницы. "
+            "Каждый вопрос должен быть на отдельной строке, без нумерации и без дополнительных символов."
         )
 
         response = client.chat.completions.create(
@@ -177,8 +175,24 @@ def get_questions_from_text(text: str) -> list[str]:
         logger.info(f'Успешно сгенерировано {len(questions)} вопросов')
         return questions[:5]
 
+    except RateLimitError as e:
+        error_msg = f'Превышен лимит запросов к OpenAI API: {str(e)}'
+        logger.error(error_msg)
+        raise Exception(error_msg) from e
+    except APIConnectionError as e:
+        error_msg = f'Ошибка соединения с OpenAI API: {str(e)}'
+        logger.error(error_msg)
+        raise Exception(error_msg) from e
+    except APITimeoutError as e:
+        error_msg = f'Таймаут при запросе к OpenAI API: {str(e)}'
+        logger.error(error_msg)
+        raise Exception(error_msg) from e
+    except APIError as e:
+        error_msg = f'Ошибка OpenAI API: {str(e)}'
+        logger.error(error_msg)
+        raise Exception(error_msg) from e
     except Exception as e:
-        error_msg = f'Ошибка при работе с OpenAI API: {str(e)}'
+        error_msg = f'Неожиданная ошибка при работе с OpenAI API: {str(e)}'
         logger.error(error_msg, exc_info=True)
         raise Exception(error_msg) from e
 

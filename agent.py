@@ -7,7 +7,7 @@ import argparse
 import logging
 import re
 import sys
-from typing import Optional
+from typing import Optional, List
 from urllib.parse import urlparse
 
 import requests
@@ -19,6 +19,8 @@ from tenacity import (
     retry_if_exception_type,
 )
 
+from openai_module import get_questions_from_text
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 # Максимальная длина текста (10000 символов)
 MAX_TEXT_LENGTH = 10000
+
+# Максимальная длина текста для OpenAI API (примерно 8000 символов для безопасности)
+MAX_TEXT_LENGTH_FOR_OPENAI = 8000
+
+# Минимальная длина текста для генерации вопросов
+MIN_TEXT_LENGTH = 50
 
 # Значимые теги для извлечения текста
 CONTENT_TAGS = [
@@ -237,12 +245,148 @@ def extract_text_from_url(url: str) -> str:
     return cleaned_text
 
 
+def smart_truncate_text(text: str, max_length: int = MAX_TEXT_LENGTH_FOR_OPENAI) -> str:
+    """
+    Умная обрезка текста с сохранением смысла.
+    Обрезает текст до максимальной длины, стараясь закончить на границе предложения.
+
+    Args:
+        text: Исходный текст
+        max_length: Максимальная длина текста
+
+    Returns:
+        Обрезанный текст
+    """
+    if len(text) <= max_length:
+        return text
+
+    logger.info(f'Текст слишком длинный ({len(text)} символов), обрезка до {max_length} символов')
+
+    # Пытаемся обрезать на границе предложения
+    truncated = text[:max_length]
+    
+    # Ищем последнюю точку, восклицательный или вопросительный знак
+    sentence_endings = ['.', '!', '?', '。', '！', '？']
+    last_sentence_end = -1
+    
+    for ending in sentence_endings:
+        pos = truncated.rfind(ending)
+        if pos > max_length * 0.7:  # Ищем только в последних 30% текста
+            last_sentence_end = max(last_sentence_end, pos)
+    
+    if last_sentence_end > 0:
+        truncated = text[:last_sentence_end + 1]
+        logger.info(f'Текст обрезан на границе предложения на позиции {last_sentence_end + 1}')
+    else:
+        # Если не нашли границу предложения, обрезаем на границе слова
+        last_space = truncated.rfind(' ')
+        if last_space > max_length * 0.7:
+            truncated = text[:last_space]
+            logger.info(f'Текст обрезан на границе слова на позиции {last_space}')
+        else:
+            truncated = text[:max_length]
+            logger.warning(f'Текст обрезан без сохранения границ предложения/слова')
+
+    return truncated
+
+
+def generate_questions_from_url(url: str) -> List[str]:
+    """
+    Полнофункциональный агент для генерации вопросов из веб-страницы.
+    
+    Логика работы:
+    1. Загружает HTML по URL
+    2. Извлекает и очищает текст
+    3. Проверяет достаточность текста
+    4. Обрезает текст при необходимости с сохранением смысла
+    5. Передает текст в OpenAI для генерации вопросов
+    6. Возвращает список из 5 вопросов
+    
+    Args:
+        url: URL веб-страницы для обработки
+    
+    Returns:
+        Список из 5 вопросов по содержанию сайта
+    
+    Raises:
+        ValueError: При некорректном URL или недостаточном тексте
+        requests.exceptions.RequestException: При проблемах с сетью
+        Exception: При ошибках OpenAI API
+    """
+    try:
+        logger.info(f'Начало работы агента для URL: {url}')
+        
+        # Шаг 1: Загрузка HTML и извлечение текста
+        logger.info('Шаг 1: Загрузка HTML и извлечение текста')
+        try:
+            text = extract_text_from_url(url)
+        except ValueError as e:
+            error_msg = f'Ошибка при извлечении текста: {str(e)}'
+            logger.error(error_msg)
+            raise ValueError(error_msg) from e
+        except requests.exceptions.RequestException as e:
+            error_msg = f'Сетевая ошибка при загрузке страницы: {str(e)}'
+            logger.error(error_msg)
+            raise requests.exceptions.RequestException(error_msg) from e
+        
+        # Шаг 2: Проверка достаточности текста
+        logger.info('Шаг 2: Проверка достаточности текста')
+        if not text or len(text.strip()) < MIN_TEXT_LENGTH:
+            error_msg = (
+                f'Недостаточно текста на странице для генерации вопросов. '
+                f'Минимум: {MIN_TEXT_LENGTH} символов, получено: {len(text.strip()) if text else 0}'
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        logger.info(f'Текст успешно извлечен. Длина: {len(text)} символов')
+        
+        # Шаг 3: Обрезка текста при необходимости
+        logger.info('Шаг 3: Проверка и обрезка текста при необходимости')
+        if len(text) > MAX_TEXT_LENGTH_FOR_OPENAI:
+            text = smart_truncate_text(text, MAX_TEXT_LENGTH_FOR_OPENAI)
+            logger.info(f'Текст обрезан до {len(text)} символов')
+        
+        # Шаг 4: Генерация вопросов через OpenAI
+        logger.info('Шаг 4: Генерация вопросов через OpenAI API')
+        try:
+            questions = get_questions_from_text(text)
+            logger.info(f'Успешно сгенерировано {len(questions)} вопросов')
+            
+            if len(questions) < 5:
+                logger.warning(f'Получено только {len(questions)} вопросов вместо 5')
+            
+            return questions
+            
+        except ValueError as e:
+            error_msg = f'Ошибка валидации при работе с OpenAI API: {str(e)}'
+            logger.error(error_msg)
+            raise ValueError(error_msg) from e
+        except Exception as e:
+            error_msg = f'Ошибка OpenAI API: {str(e)}'
+            logger.error(error_msg, exc_info=True)
+            raise Exception(error_msg) from e
+        
+    except ValueError:
+        # Переподнимаем ValueError без изменений
+        raise
+    except requests.exceptions.RequestException:
+        # Переподнимаем сетевые ошибки без изменений
+        raise
+    except Exception as e:
+        # Обрабатываем все остальные неожиданные ошибки
+        error_msg = f'Неожиданная ошибка при работе агента: {str(e)}'
+        logger.error(error_msg, exc_info=True)
+        raise Exception(error_msg) from e
+
+
 def main() -> None:
     """
     Основная функция для запуска модуля из командной строки.
+    Генерирует вопросы на основе содержимого веб-страницы.
     """
     parser = argparse.ArgumentParser(
-        description='Извлечение текста из веб-страницы'
+        description='Генерация вопросов на основе содержимого веб-страницы'
     )
     parser.add_argument(
         'url',
@@ -253,20 +397,28 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        text = extract_text_from_url(args.url)
+        # Генерируем вопросы
+        questions = generate_questions_from_url(args.url)
         
-        # Сохранение текста в файл
-        output_file = 'text.txt'
+        # Выводим вопросы
+        print('\nСгенерированные вопросы:')
+        print('=' * 50)
+        for i, question in enumerate(questions, 1):
+            print(f'{i}. {question}')
+        print('=' * 50)
+        
+        # Сохранение вопросов в файл
+        output_file = 'questions.txt'
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(text)
-            logger.info(f'Текст сохранен в файл: {output_file}')
-            print(f'Текст сохранен в файл: {output_file}')
+                for i, question in enumerate(questions, 1):
+                    f.write(f'{i}. {question}\n')
+            logger.info(f'Вопросы сохранены в файл: {output_file}')
+            print(f'\nВопросы сохранены в файл: {output_file}')
         except IOError as e:
             logger.error(f'Ошибка при сохранении в файл: {str(e)}')
             print(f'Ошибка при сохранении в файл: {str(e)}', file=sys.stderr)
         
-        print(text)
         sys.exit(0)
 
     except ValueError as e:
@@ -279,14 +431,24 @@ def main() -> None:
         print(f'HTTP ошибка: {str(e)}', file=sys.stderr)
         sys.exit(1)
 
+    except requests.exceptions.Timeout as e:
+        logger.error(f'Таймаут: {str(e)}')
+        print(f'Таймаут при загрузке страницы: {str(e)}', file=sys.stderr)
+        sys.exit(1)
+
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f'Ошибка соединения: {str(e)}')
+        print(f'Ошибка соединения: {str(e)}', file=sys.stderr)
+        sys.exit(1)
+
     except requests.exceptions.RequestException as e:
         logger.error(f'Сетевая ошибка: {str(e)}')
         print(f'Сетевая ошибка: {str(e)}', file=sys.stderr)
         sys.exit(1)
 
     except Exception as e:
-        logger.error(f'Неожиданная ошибка: {str(e)}', exc_info=True)
-        print(f'Ошибка: {str(e)}', file=sys.stderr)
+        logger.error(f'Ошибка OpenAI API: {str(e)}', exc_info=True)
+        print(f'Ошибка OpenAI API: {str(e)}', file=sys.stderr)
         sys.exit(1)
 
 
